@@ -556,18 +556,24 @@
     if (!resuming) {
       pending = null;
       if (puzzle.type === 'A') {
-        /* grab the nearest inner tip-dot, snapping rather than refusing */
-        grabTip = null;
+        /* Grab the nearest inner tip-dot, snapping rather than refusing.
+           The candidate is held locally and only becomes grabTip once
+           the grab succeeds: clearing grabTip up front left a keyboard
+           guide edge (kbAim) anchored to nothing, and the next Enter
+           threw on grabTip.x inside commitStroke — forever, since kbAim
+           survived the refusal too. */
+        var tip = null;
         var bestD = grabR * GRAB_SNAP;
         for (i = 0; i < puzzle.segs.length; i++) {
           s = puzzle.segs[i];
           d = Math.hypot(p.x - s.x1, p.y - s.y1);
-          if (d <= bestD) { bestD = d; grabTip = { x: s.x1, y: s.y1 }; }
+          if (d <= bestD) { bestD = d; tip = { x: s.x1, y: s.y1 }; }
         }
-        if (!grabTip) {
+        if (!tip) {
           hint.textContent = 'start near one of the tip-dots, then stroke the edge onward.';
           return;
         }
+        grabTip = tip;
         if (bestD > grabR) {
           /* outside the dot but inside the snap ring: put the first
              sample ON the dot instead of throwing the stroke away */
@@ -601,7 +607,7 @@
     }
   });
 
-  canvas.addEventListener('pointerup', function (ev) {
+  function onStrokeUp(ev) {
     if (!stroke || ev.pointerId !== strokeId || phase !== 'play') return;
     ev.preventDefault();
     var pts = stroke;
@@ -611,9 +617,9 @@
     pts.push(end);
     lastLift = { x: end.x, y: end.y, at: Date.now() };
     commitStroke(pts);
-  });
+  }
 
-  canvas.addEventListener('pointercancel', function (ev) {
+  function onStrokeCancel(ev) {
     /* an interrupted drag is abandoned, never scored — but only the pointer
        that owns the stroke may abandon it, or a stray second finger being
        cancelled would wipe the drag in progress */
@@ -621,9 +627,32 @@
     stroke = null;
     strokeId = null;
     draw();
-  });
+  }
+
+  canvas.addEventListener('pointerup', onStrokeUp);
+  canvas.addEventListener('pointercancel', onStrokeCancel);
+  /* A release the canvas never sees left `stroke` set for the rest of
+     the round — and pointerdown returns early while one is in flight,
+     so the sheet accepted no more ink until "new round". Both the
+     off-window release and iOS, which drops the capture with
+     lostpointercapture and never sends pointerup. A lost capture has no
+     honest end position, so it abandons the stroke rather than score
+     one; after a real pointerup strokeId is already null and these are
+     no-ops. */
+  window.addEventListener('pointerup', onStrokeUp);
+  window.addEventListener('pointercancel', onStrokeCancel);
+  canvas.addEventListener('lostpointercapture', onStrokeCancel);
 
   function commitStroke(pts) {
+    /* A type-A mark is scored against the tip it grew from; with no
+       anchor there is nothing to score. Unreachable now that a refused
+       grab leaves grabTip alone, but commitStroke is the keyboard's
+       entry point too and must never be able to throw. */
+    if (puzzle.type === 'A' && !grabTip) {
+      hint.textContent = 'start near one of the tip-dots, then stroke the edge onward.';
+      draw();
+      return;
+    }
     var span = Math.hypot(pts[pts.length - 1].x - pts[0].x, pts[pts.length - 1].y - pts[0].y);
     var ease = ArtDaily.ease(1);
     var r = null;

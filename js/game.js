@@ -1,12 +1,18 @@
 /* ============================================================
    game.js — Vanishing Act. Six perspective puzzles per round,
-   alternating two verbs:
-     odd  (A) two receding edges are drawn — tap the hidden
-              vanishing point where their extensions meet;
-     even (B) the vanishing point is shown — press the bold
-              start dot and drag the receding edge into it.
+   alternating two halves of one skill, both drawn by hand:
+     odd  (A) two receding edges are drawn — press an edge's
+              tip-dot and STROKE the edge onward to the hidden
+              vanishing point; scored on your stroke's angle and
+              on where its line crosses the horizon vs the true VP;
+     even (B) the vanishing point is shown — press the bold start
+              dot and drag the receding edge into it, blind: the
+              ink only appears when you release.
    Scoring is pure geometry (helpers at the top, canvas-free so
-   they are unit-testable); the round reports the mean of six.
+   they are unit-testable); straightness counts — a steered arc
+   scores below a confident straight stroke. Reveals are player-
+   paced (tap/Enter to advance) and the round ends on a recap
+   with a hunt/aim split; the round reports the mean of six.
    Skeleton follows the template: init → round → input → score →
    ArtDaily.report, one theme-aware canvas, no libraries.
    ============================================================ */
@@ -15,23 +21,14 @@
 
   var SLUG = 'perspective';
   var PUZZLES_PER_ROUND = 6;
-  var REVEAL_MS = 1400;   /* how long the accent reveal stays up */
-  var GRAB_RADIUS = 28;   /* px around P that starts a type-B stroke */
+  var GRAB_RADIUS = 28;   /* px around a start dot that begins a stroke */
   var MIN_STROKE = 24;    /* px of drag before an angle can be read */
   var MARGIN = 14;        /* constructions keep off the canvas edge */
+  var KB_LEN = 0.35;      /* keyboard guide-edge length, fraction of W */
 
   /* ===== pure scoring math (geometry in, 0–100 out) ===== */
 
   function clamp01(v) { return Math.max(0, Math.min(1, v)); }
-
-  /* Type A: tap error as a fraction of canvas width.
-     err = dist(tap, VP) / W; score = 100 * clamp(1 - err/0.12, 0, 1).
-     Within ~7% of the width scores 40; ~1% scores 90; dead-on is 100. */
-  function scoreVpTap(tapX, tapY, vpX, vpY, canvasWidth) {
-    if (!(canvasWidth > 0)) return 0; /* degenerate canvas: never NaN */
-    var err = Math.hypot(tapX - vpX, tapY - vpY) / canvasWidth;
-    return 100 * clamp01(1 - err / 0.12);
-  }
 
   /* Fold an angular difference to [0, 90] degrees — a drawn edge has
      no inherent direction, so 178° off really means 2° off. */
@@ -40,9 +37,11 @@
     return d > 90 ? 180 - d : d;
   }
 
-  /* Principal axis (degrees) of a point cloud, least-squares fit;
-     null when the points do not span a line. */
-  function fitDirectionDeg(points) {
+  /* Least-squares line through a point cloud: principal direction in
+     degrees, centroid, and the RMS perpendicular residual (how far
+     the points wobble off their own best line). Null when the points
+     do not span a line. */
+  function fitLine(points) {
     var n = points.length;
     if (n < 2) return null;
     var mx = 0, my = 0, i;
@@ -53,18 +52,74 @@
       dx = points[i].x - mx; dy = points[i].y - my;
       sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
     }
-    if (sxx + syy < 1e-6) return null;
-    return 0.5 * Math.atan2(2 * sxy, sxx - syy) * 180 / Math.PI;
+    var tr = sxx + syy;
+    if (tr < 1e-6) return null;
+    var disc = Math.sqrt(Math.max(0, (sxx - syy) * (sxx - syy) + 4 * sxy * sxy));
+    var lambdaMin = (tr - disc) / 2; /* variance perpendicular to the fit */
+    return {
+      deg: 0.5 * Math.atan2(2 * sxy, sxx - syy) * 180 / Math.PI,
+      cx: mx, cy: my,
+      rms: Math.sqrt(Math.max(0, lambdaMin) / n)
+    };
+  }
+
+  /* Straightness factor in [0.6, 1]: free below 1% wobble-per-span
+     (honest hand tremor), sliding penalty up to 40% by 7% — a slow
+     steered arc can't cash in on where it happened to end up. */
+  function straightnessFactor(rms, span) {
+    if (!(span > 0)) return 1;
+    var r = rms / span;
+    return 0.6 + 0.4 * clamp01(1 - Math.max(0, r - 0.01) / 0.06);
   }
 
   /* Type B: angle between the stroke's best-fit line and the true
-     P→VP edge, folded to [0,90]; score = 100 * clamp(1 - angErr/14).
-     Within 8.4° scores 40; 1.4° scores 90; exactly on line is 100. */
+     P→VP edge, folded to [0,90]; base = 100 * clamp(1 - angErr/14),
+     scaled by straightness. missY = where the drawn line crosses the
+     VP's vertical, minus vpY (negative = aimed high). */
   function scoreEdgeStroke(points, pX, pY, vpX, vpY) {
-    var drawn = fitDirectionDeg(points);
-    if (drawn === null) return null;
+    var fit = fitLine(points);
+    if (fit === null) return null;
+    var span = Math.hypot(points[points.length - 1].x - points[0].x,
+                          points[points.length - 1].y - points[0].y);
     var trueDeg = Math.atan2(vpY - pY, vpX - pX) * 180 / Math.PI;
-    return 100 * clamp01(1 - foldDeg(drawn - trueDeg) / 14);
+    var angErr = foldDeg(fit.deg - trueDeg);
+    var th = fit.deg * Math.PI / 180;
+    var missY = Math.abs(Math.cos(th)) < 1e-6
+      ? null
+      : fit.cy + (vpX - fit.cx) * Math.tan(th) - vpY;
+    return {
+      score: 100 * clamp01(1 - angErr / 14) * straightnessFactor(fit.rms, span),
+      angErr: angErr,
+      missY: missY
+    };
+  }
+
+  /* Type A: the stroke extends a given edge (from tipX,tipY) toward
+     the hidden VP. Half the score is the angle off the true tip→VP
+     ray; half is where the drawn line crosses the horizon (y = vpY)
+     vs the true VP, as a fraction of canvas width (same 0.12
+     tolerance the old tap used). Straightness scales the total.
+     missX = crossing minus vpX (negative = crossed left of the VP). */
+  function scoreVpStroke(points, tipX, tipY, vpX, vpY, canvasWidth) {
+    if (!(canvasWidth > 0)) return null;
+    var fit = fitLine(points);
+    if (fit === null) return null;
+    var span = Math.hypot(points[points.length - 1].x - points[0].x,
+                          points[points.length - 1].y - points[0].y);
+    var trueDeg = Math.atan2(vpY - tipY, vpX - tipX) * 180 / Math.PI;
+    var angErr = foldDeg(fit.deg - trueDeg);
+    var angleScore = 100 * clamp01(1 - angErr / 14);
+    var th = fit.deg * Math.PI / 180;
+    var missX = null, crossScore = 0;
+    if (Math.abs(Math.sin(th)) >= 1e-3) {
+      missX = fit.cx + (vpY - fit.cy) / Math.tan(th) - vpX;
+      crossScore = 100 * clamp01(1 - (Math.abs(missX) / canvasWidth) / 0.12);
+    }
+    return {
+      score: (0.5 * angleScore + 0.5 * crossScore) * straightnessFactor(fit.rms, span),
+      angErr: angErr,
+      missX: missX
+    };
   }
 
   /* ===== chrome ===== */
@@ -80,12 +135,35 @@
   ArtDaily.init({ slug: SLUG });
 
   /* ---- theme-aware inks (re-read on every repaint) ---- */
+
+  function hexRGB(h) {
+    if (!/^#[0-9a-fA-F]{6}$/.test(h)) return null;
+    return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+  }
+
+  function mixHex(a, b, wa) {
+    var ca = hexRGB(a), cb = hexRGB(b), out = '#', i, v;
+    if (!ca || !cb) return a;
+    for (i = 0; i < 3; i++) {
+      v = Math.round(ca[i] * wa + cb[i] * (1 - wa));
+      out += (v < 16 ? '0' : '') + v.toString(16);
+    }
+    return out;
+  }
+
   function inks() {
     var cs = getComputedStyle(document.documentElement);
+    var ink = cs.getPropertyValue('--ink').trim();
+    var accent = cs.getPropertyValue('--game-accent').trim() || cs.getPropertyValue('--bubblegum').trim();
+    /* the stylesheet's sticker recipe: bubblegum inked 55/45 toward graphite
+       on paper (2.95:1 raw → 5.71:1), pure accent on the dark sheet where it
+       already clears AA. Everything the reveal means — the true VP, the
+       construction lines, the score — is painted in this. */
+    if (ArtDaily.theme() !== 'dark') accent = mixHex(accent, ink, 0.55);
     return {
-      ink: cs.getPropertyValue('--ink').trim(),
+      ink: ink,
       muted: cs.getPropertyValue('--muted').trim(),
-      accent: cs.getPropertyValue('--game-accent').trim() || cs.getPropertyValue('--bubblegum').trim(),
+      accent: accent,
     };
   }
 
@@ -104,11 +182,13 @@
 
   /* ===== round state ===== */
   /* phase: 'idle' | 'play' | 'reveal' */
-  var round = 0, idx = 0, scores = [], puzzle = null, phase = 'idle';
-  var stroke = null;       /* in-progress type-B drag samples */
+  var round = 0, idx = 0, results = [], puzzle = null, phase = 'idle';
+  var stroke = null;       /* in-progress drag samples */
   var strokeId = null;     /* pointer that owns the stroke (ignore extra fingers) */
-  var reveal = null;       /* { score, tap | points } after each puzzle */
-  var revealTimer = null;
+  var grabTip = null;      /* type A: which edge tip the stroke grew from */
+  var kbAim = null;        /* keyboard guide edge: {x, y, deg} */
+  var reveal = null;       /* { score, points, missX, detail } after each puzzle */
+  var recap = null;        /* end-of-round recap data */
 
   function rand(lo, hi) { return lo + Math.random() * (hi - lo); }
   function deg(r) { return r * 180 / Math.PI; }
@@ -132,7 +212,7 @@
     var e = (eMin <= eMax ? rand(eMin, eMax) : Math.max(8, Math.min(eMin, eMax))) * Math.PI / 180;
     var ux = side * Math.cos(e), uy = vSign * Math.sin(e);
     return {
-      x1: vpX + ux * gap, y1: vpY + uy * gap,
+      x1: vpX + ux * gap, y1: vpY + uy * gap,   /* inner tip (nearer the VP) */
       x2: vpX + ux * (gap + len), y2: vpY + uy * (gap + len)
     };
   }
@@ -174,24 +254,27 @@
   function nextPuzzle() {
     reveal = null;
     stroke = null;
+    strokeId = null;
+    grabTip = null;
+    kbAim = null;
     var typeA = idx % 2 === 0;
     puzzle = typeA ? makePuzzleA(Math.floor(idx / 2)) : makePuzzleB(Math.floor(idx / 2));
     phase = 'play';
     hint.textContent = typeA
-      ? 'puzzle ' + (idx + 1) + ' of ' + PUZZLES_PER_ROUND + ' — two edges recede. tap the point where they meet.'
-      : 'puzzle ' + (idx + 1) + ' of ' + PUZZLES_PER_ROUND + ' — press the bold dot, drag the edge into the ringed point.';
+      ? 'puzzle ' + (idx + 1) + ' of ' + PUZZLES_PER_ROUND + ' — two edges recede. press a tip-dot, stroke the edge on to their hidden meeting point.'
+      : 'puzzle ' + (idx + 1) + ' of ' + PUZZLES_PER_ROUND + ' — press the bold dot, drag the edge into the ringed point. blind: ink shows when you release.';
     draw();
   }
 
-  function newRound() {
-    /* "new round" mid-reveal of the last puzzle: the round *was*
+  function doNewRound() {
+    /* "new round" during the last reveal or recap: the round *was*
        completed, so report it before resetting — completed rounds
        always reach ArtDaily.report exactly once. */
-    if (phase === 'reveal' && scores.length === PUZZLES_PER_ROUND) finishRound();
+    if (phase === 'reveal' && results.length === PUZZLES_PER_ROUND) finishRound();
     round += 1;
     idx = 0;
-    scores = [];
-    clearTimeout(revealTimer);
+    results = [];
+    recap = null;
     hudRound.textContent = String(round);
     hudScore.textContent = '–';
     nextPuzzle();
@@ -218,55 +301,106 @@
     ctx.stroke();
   }
 
+  function startDot(c, x, y) {
+    ctx.fillStyle = c.ink;
+    dot(x, y, 8);
+    ctx.strokeStyle = c.muted;
+    ctx.lineWidth = 1.5;
+    ctx.globalAlpha = 0.85; /* the grab affordance has to read: AA on both papers */
+    ring(x, y, 14);
+    ctx.globalAlpha = 1;
+  }
+
+  function drawPolyline(pts) {
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.stroke();
+  }
+
   function draw() {
     var c = inks();
     ctx.clearRect(0, 0, W, H);
-    if (!puzzle) return;
+    if (!puzzle) {
+      if (recap) drawRecap(c);
+      return;
+    }
 
-    /* muted horizon */
+    /* The horizon carries the whole drill ("the point always sits ON it"),
+       so it stays subordinate to the 3px ink edges but never below AA. */
     ctx.strokeStyle = c.muted;
     ctx.lineWidth = 1.5;
-    ctx.globalAlpha = 0.6;
+    ctx.globalAlpha = 0.85;
     line(0, puzzle.hy, W, puzzle.hy);
     ctx.globalAlpha = 1;
 
     ctx.lineCap = 'round';
+    var i, s;
     if (puzzle.type === 'A') {
-      /* the two given receding edges */
+      /* the two given receding edges, with grabbable inner tip-dots */
       ctx.strokeStyle = c.ink;
       ctx.lineWidth = 3;
-      var i, s;
       for (i = 0; i < puzzle.segs.length; i++) {
         s = puzzle.segs[i];
         line(s.x1, s.y1, s.x2, s.y2);
       }
-    } else {
-      /* visible VP: accent ring on the horizon */
-      ctx.strokeStyle = c.accent;
-      ctx.lineWidth = 2.5;
-      ring(puzzle.vpX, puzzle.vpY, 7);
-      ctx.fillStyle = c.accent;
-      dot(puzzle.vpX, puzzle.vpY, 2.5);
-      /* bold start dot P with a grab halo */
-      ctx.fillStyle = c.ink;
-      dot(puzzle.pX, puzzle.pY, 8);
-      ctx.strokeStyle = c.muted;
-      ctx.lineWidth = 1.5;
-      ctx.globalAlpha = 0.7;
-      ring(puzzle.pX, puzzle.pY, 14);
-      ctx.globalAlpha = 1;
-      /* live stroke */
-      if (stroke && stroke.length > 1) {
+      if (phase === 'play') {
+        for (i = 0; i < puzzle.segs.length; i++) startDot(c, puzzle.segs[i].x1, puzzle.segs[i].y1);
+      }
+      /* live stroke — visible for A: the target point is hidden, so
+         seeing your own extension gives nothing away */
+      if (phase === 'play' && stroke && stroke.length > 1) {
         ctx.strokeStyle = c.ink;
         ctx.lineWidth = 2.5;
-        ctx.beginPath();
-        ctx.moveTo(stroke[0].x, stroke[0].y);
-        for (i = 1; i < stroke.length; i++) ctx.lineTo(stroke[i].x, stroke[i].y);
-        ctx.stroke();
+        drawPolyline(stroke);
+      }
+    } else {
+      /* visible VP: accent ring on the horizon (big enough for thumbs) */
+      ctx.strokeStyle = c.accent;
+      ctx.lineWidth = 3;
+      ring(puzzle.vpX, puzzle.vpY, 10);
+      ctx.fillStyle = c.accent;
+      dot(puzzle.vpX, puzzle.vpY, 3);
+      /* bold start dot P with a grab halo */
+      startDot(c, puzzle.pX, puzzle.pY);
+      /* blind stroke: only the fingertip shows while drawing — the
+         ink appears on release, so the drill tests aim, not tracing */
+      if (phase === 'play' && stroke && stroke.length > 0) {
+        ctx.fillStyle = c.ink;
+        dot(stroke[stroke.length - 1].x, stroke[stroke.length - 1].y, 3.5);
       }
     }
 
+    /* keyboard guide edge */
+    if (phase === 'play' && kbAim) {
+      ctx.strokeStyle = c.ink;
+      ctx.lineWidth = 2;
+      ctx.setLineDash([8, 6]);
+      var th = kbAim.deg * Math.PI / 180;
+      line(kbAim.x, kbAim.y, kbAim.x + Math.cos(th) * KB_LEN * W, kbAim.y + Math.sin(th) * KB_LEN * W);
+      ctx.setLineDash([]);
+    }
+
     if (reveal) drawReveal(c);
+  }
+
+  /* pick the score-flash spot furthest from the action so the number
+     never overprints the VP or the reveal lines */
+  function flashPos(avoid) {
+    var cands = [
+      { x: W * 0.18, y: 34 }, { x: W * 0.82, y: 34 },
+      { x: W * 0.18, y: H - 16 }, { x: W * 0.82, y: H - 16 }
+    ];
+    var best = cands[0], bestD = -1, i, j, d, m;
+    for (i = 0; i < cands.length; i++) {
+      m = Infinity;
+      for (j = 0; j < avoid.length; j++) {
+        d = Math.hypot(cands[i].x - avoid[j].x, cands[i].y - avoid[j].y);
+        if (d < m) m = d;
+      }
+      if (m > bestD) { bestD = m; best = cands[i]; }
+    }
+    return best;
   }
 
   /* Reveal: every construction line extended home to the true VP in
@@ -291,30 +425,58 @@
     dot(puzzle.vpX, puzzle.vpY, 4);
     ring(puzzle.vpX, puzzle.vpY, 9);
 
-    /* the player's answer */
-    if (reveal.tap) {
-      ctx.strokeStyle = c.ink;
-      ctx.lineWidth = 2.5;
-      line(reveal.tap.x - 7, reveal.tap.y - 7, reveal.tap.x + 7, reveal.tap.y + 7);
-      line(reveal.tap.x - 7, reveal.tap.y + 7, reveal.tap.x + 7, reveal.tap.y - 7);
-    }
+    /* the player's stroke */
+    var avoid = [{ x: puzzle.vpX, y: puzzle.vpY }];
     if (reveal.points && reveal.points.length > 1) {
       ctx.strokeStyle = c.ink;
       ctx.lineWidth = 2.5;
       ctx.globalAlpha = 0.9;
-      ctx.beginPath();
-      ctx.moveTo(reveal.points[0].x, reveal.points[0].y);
-      for (i = 1; i < reveal.points.length; i++) ctx.lineTo(reveal.points[i].x, reveal.points[i].y);
-      ctx.stroke();
+      drawPolyline(reveal.points);
       ctx.globalAlpha = 1;
+      avoid.push(reveal.points[0]);
+      avoid.push(reveal.points[reveal.points.length - 1]);
+    }
+    /* type A: × where the drawn line actually crossed the horizon */
+    if (reveal.missX !== null && reveal.missX !== undefined) {
+      var cx = Math.max(10, Math.min(W - 10, puzzle.vpX + reveal.missX));
+      ctx.strokeStyle = c.ink;
+      ctx.lineWidth = 2.5;
+      line(cx - 6, puzzle.vpY - 6, cx + 6, puzzle.vpY + 6);
+      line(cx - 6, puzzle.vpY + 6, cx + 6, puzzle.vpY - 6);
+      avoid.push({ x: cx, y: puzzle.vpY });
     }
 
-    /* score flash */
+    /* score flash, placed away from the action */
+    var pos = flashPos(avoid);
     ctx.fillStyle = c.accent;
     ctx.font = '900 30px ui-monospace, Menlo, Consolas, monospace';
     ctx.textAlign = 'center';
-    ctx.fillText(String(reveal.score), W / 2, 40);
+    ctx.fillText(String(reveal.score), pos.x, pos.y);
     ctx.restore();
+  }
+
+  /* End-of-round recap: the six scores and the hunt/aim split stay on
+     the sheet until the next round starts. */
+  function drawRecap(c) {
+    var mono = 'ui-monospace, Menlo, Consolas, monospace';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = c.muted;
+    ctx.font = '600 14px ' + mono;
+    ctx.fillText('round ' + recap.round + ' — six puzzles', W / 2, H * 0.18);
+    ctx.fillStyle = c.accent;
+    ctx.font = '900 ' + Math.round(Math.max(30, Math.min(46, W * 0.09))) + 'px ' + mono;
+    ctx.fillText(String(recap.mean), W / 2, H * 0.38);
+    ctx.fillStyle = c.ink;
+    ctx.font = '600 15px ' + mono;
+    if (recap.hunt.length > 0) {
+      ctx.fillText('hunt the point   ' + recap.hunt.join(' · ') + '   → ' + recap.huntMean, W / 2, H * 0.56);
+    }
+    if (recap.aim.length > 0) {
+      ctx.fillText('aim the edge     ' + recap.aim.join(' · ') + '   → ' + recap.aimMean, W / 2, H * 0.68);
+    }
+    ctx.fillStyle = c.muted;
+    ctx.font = '600 13px ' + mono;
+    ctx.fillText('press “new round” to hunt again', W / 2, H * 0.86);
   }
 
   /* ===== input ===== */
@@ -325,21 +487,38 @@
   }
 
   canvas.addEventListener('pointerdown', function (ev) {
-    if (phase !== 'play' || !puzzle) return;
-    ev.preventDefault();
-    var p = pointerPos(ev);
-    if (puzzle.type === 'A') {
-      settlePuzzle(scoreVpTap(p.x, p.y, puzzle.vpX, puzzle.vpY, W), { tap: p });
+    /* reveals are player-paced: a tap moves on */
+    if (phase === 'reveal') {
+      ev.preventDefault();
+      advanceReveal();
       return;
     }
-    if (stroke) return; /* one finger draws; extras are ignored */
-    if (Math.hypot(p.x - puzzle.pX, p.y - puzzle.pY) > GRAB_RADIUS) {
-      hint.textContent = 'start on the bold dot, then drag toward the ringed point.';
-      return;
+    if (phase !== 'play' || !puzzle || stroke) return;
+    ev.preventDefault();
+    var p = pointerPos(ev), i, s, d;
+    if (puzzle.type === 'A') {
+      /* grab the nearest inner tip-dot */
+      grabTip = null;
+      var bestD = GRAB_RADIUS;
+      for (i = 0; i < puzzle.segs.length; i++) {
+        s = puzzle.segs[i];
+        d = Math.hypot(p.x - s.x1, p.y - s.y1);
+        if (d <= bestD) { bestD = d; grabTip = { x: s.x1, y: s.y1 }; }
+      }
+      if (!grabTip) {
+        hint.textContent = 'start on one of the tip-dots, then stroke the edge onward.';
+        return;
+      }
+    } else {
+      if (Math.hypot(p.x - puzzle.pX, p.y - puzzle.pY) > GRAB_RADIUS) {
+        hint.textContent = 'start on the bold dot, then drag toward the ringed point.';
+        return;
+      }
     }
     try { canvas.setPointerCapture(ev.pointerId); } catch (e) {}
     stroke = [p];
     strokeId = ev.pointerId;
+    kbAim = null;
     draw();
   });
 
@@ -361,54 +540,139 @@
     stroke = null;
     strokeId = null;
     pts.push(pointerPos(ev));
-    var span = Math.hypot(pts[pts.length - 1].x - pts[0].x, pts[pts.length - 1].y - pts[0].y);
-    var s = span < MIN_STROKE ? null : scoreEdgeStroke(pts, puzzle.pX, puzzle.pY, puzzle.vpX, puzzle.vpY);
-    if (s === null) {
-      hint.textContent = 'too short — drag a longer edge so its angle can be read.';
-      draw();
-      return;
-    }
-    settlePuzzle(s, { points: pts });
+    commitStroke(pts);
   });
 
-  canvas.addEventListener('pointercancel', function () {
+  canvas.addEventListener('pointercancel', function (ev) {
+    /* an interrupted drag is abandoned, never scored — but only the pointer
+       that owns the stroke may abandon it, or a stray second finger being
+       cancelled would wipe the drag in progress */
+    if (ev.pointerId !== strokeId) return;
     stroke = null;
     strokeId = null;
     draw();
   });
 
-  /* ===== score bookkeeping ===== */
-
-  function feedbackLine(s) {
-    var word = s >= 90 ? 'nailed it' : s >= 70 ? 'close' : s >= 40 ? 'drifting' : 'wide of the mark';
-    return word + ' — ' + s + ' for that one.';
+  function commitStroke(pts) {
+    var span = Math.hypot(pts[pts.length - 1].x - pts[0].x, pts[pts.length - 1].y - pts[0].y);
+    var r = null;
+    if (span >= MIN_STROKE) {
+      r = puzzle.type === 'A'
+        ? scoreVpStroke(pts, grabTip.x, grabTip.y, puzzle.vpX, puzzle.vpY, W)
+        : scoreEdgeStroke(pts, puzzle.pX, puzzle.pY, puzzle.vpX, puzzle.vpY);
+    }
+    if (r === null) {
+      hint.textContent = 'too short — stroke a longer edge so its angle can be read.';
+      draw();
+      return;
+    }
+    settlePuzzle(r, pts);
   }
 
-  function settlePuzzle(score, attempt) {
-    scores.push(score);
-    reveal = { score: Math.round(score), tap: attempt.tap || null, points: attempt.points || null };
+  /* keyboard play on the focused canvas: arrows aim a guide edge
+     (shift = fine), Enter commits it; Enter/space advances a reveal */
+  canvas.addEventListener('keydown', function (ev) {
+    if (phase === 'reveal' && (ev.key === 'Enter' || ev.key === ' ')) {
+      ev.preventDefault();
+      advanceReveal();
+      return;
+    }
+    if (phase !== 'play' || !puzzle) return;
+    var arrows = { ArrowLeft: -1, ArrowUp: -1, ArrowRight: 1, ArrowDown: 1 };
+    if (ev.key in arrows) {
+      ev.preventDefault();
+      if (!kbAim) {
+        var ox, oy;
+        if (puzzle.type === 'A') {
+          grabTip = { x: puzzle.segs[0].x1, y: puzzle.segs[0].y1 };
+          ox = grabTip.x; oy = grabTip.y;
+        } else {
+          ox = puzzle.pX; oy = puzzle.pY;
+        }
+        /* start horizontal toward the VP's side — never the answer */
+        kbAim = { x: ox, y: oy, deg: puzzle.vpX >= ox ? 0 : 180 };
+      }
+      kbAim.deg += arrows[ev.key] * (ev.shiftKey ? 0.5 : 2);
+      draw();
+    } else if (ev.key === 'Enter' && kbAim) {
+      ev.preventDefault();
+      var th = kbAim.deg * Math.PI / 180;
+      commitStroke([
+        { x: kbAim.x, y: kbAim.y },
+        { x: kbAim.x + Math.cos(th) * KB_LEN * W, y: kbAim.y + Math.sin(th) * KB_LEN * W }
+      ]);
+      kbAim = null;
+    } else if (ev.key === 'Escape' && kbAim) {
+      ev.preventDefault();
+      kbAim = null;
+      draw();
+    }
+  });
+
+  /* ===== score bookkeeping ===== */
+
+  function detailFor(type, r) {
+    if (type === 'A') {
+      if (r.missX === null) return 'edge never met the horizon';
+      return Math.round(Math.abs(r.missX)) + 'px ' + (r.missX > 0 ? 'right' : 'left') + ' of the point';
+    }
+    var out = r.angErr.toFixed(1) + '° off';
+    if (r.missY !== null) out += ', aimed ' + Math.round(Math.abs(r.missY)) + 'px ' + (r.missY < 0 ? 'high' : 'low');
+    return out;
+  }
+
+  function feedbackLine(s, detail) {
+    var word = s >= 90 ? 'nailed it' : s >= 70 ? 'close' : s >= 40 ? 'drifting' : 'wide of the mark';
+    return word + ' — ' + s + ' (' + detail + ').';
+  }
+
+  function settlePuzzle(r, pts) {
+    results.push({ type: puzzle.type, score: r.score });
+    reveal = {
+      score: Math.round(r.score),
+      points: pts,
+      missX: puzzle.type === 'A' ? r.missX : null
+    };
     phase = 'reveal';
-    hint.textContent = feedbackLine(reveal.score);
+    hint.textContent = feedbackLine(reveal.score, detailFor(puzzle.type, r))
+      + (results.length < PUZZLES_PER_ROUND ? ' tap for the next puzzle.' : ' tap to finish the round.');
     draw();
-    clearTimeout(revealTimer);
-    revealTimer = setTimeout(function () {
-      idx += 1;
-      if (idx < PUZZLES_PER_ROUND) nextPuzzle();
-      else finishRound();
-    }, REVEAL_MS);
+  }
+
+  function advanceReveal() {
+    if (phase !== 'reveal') return;
+    idx += 1;
+    if (idx < PUZZLES_PER_ROUND) nextPuzzle();
+    else finishRound();
   }
 
   function finishRound() {
     phase = 'idle';
     puzzle = null;
     reveal = null;
-    draw();
-    var mean = scores.reduce(function (a, b) { return a + b; }, 0) / scores.length;
-    var res = ArtDaily.report(mean);
+    kbAim = null;
+    grabTip = null;
+    var sum = 0, hunt = [], aim = [], hSum = 0, aSum = 0, i, e;
+    for (i = 0; i < results.length; i++) {
+      e = results[i];
+      sum += e.score;
+      if (e.type === 'A') { hunt.push(Math.round(e.score)); hSum += e.score; }
+      else { aim.push(Math.round(e.score)); aSum += e.score; }
+    }
+    var res = ArtDaily.report(sum / results.length);
+    recap = {
+      round: round,
+      mean: res.score,
+      hunt: hunt,
+      aim: aim,
+      huntMean: hunt.length > 0 ? Math.round(hSum / hunt.length) : 0,
+      aimMean: aim.length > 0 ? Math.round(aSum / aim.length) : 0
+    };
     hudScore.textContent = String(res.score);
     hudBest.textContent = res.best === null ? '–' : String(res.best);
     hint.textContent = 'round done — press “new round” to hunt again.';
     showToast((res.isNewBest ? 'new best! ' : 'score ') + res.score + ' / 100', res.isNewBest);
+    draw();
   }
 
   var toastTimer = null;
@@ -425,7 +689,36 @@
 
   /* ===== chrome wiring ===== */
 
-  document.getElementById('btnRound').addEventListener('click', newRound);
+  /* "new round" mid-round would silently discard progress, so the
+     first press arms a confirmation; a second press within 2.5s
+     confirms. A fresh or finished round starts immediately. */
+  var btnRound = document.getElementById('btnRound');
+  var btnRoundHTML = btnRound.innerHTML;
+  var confirmArmed = false, confirmTimer = null;
+
+  function disarmConfirm() {
+    confirmArmed = false;
+    clearTimeout(confirmTimer);
+    btnRound.innerHTML = btnRoundHTML;
+  }
+
+  function roundInProgress() {
+    if (!puzzle) return false;
+    if (results.length >= PUZZLES_PER_ROUND) return false; /* finished, just unreported */
+    return idx > 0 || results.length > 0;
+  }
+
+  btnRound.addEventListener('click', function () {
+    if (roundInProgress() && !confirmArmed) {
+      confirmArmed = true;
+      btnRound.textContent = 'discard round?';
+      clearTimeout(confirmTimer);
+      confirmTimer = setTimeout(disarmConfirm, 2500);
+      return;
+    }
+    disarmConfirm();
+    doNewRound();
+  });
 
   var btnHow = document.getElementById('btnHow');
   var howTo = document.getElementById('howTo');
@@ -449,8 +742,10 @@
       }
     }
     if (puzzle.type === 'B') { puzzle.pX *= f; puzzle.pY *= f; }
-    if (reveal && reveal.tap) scalePoint(reveal.tap, f);
+    if (grabTip) scalePoint(grabTip, f);
+    if (kbAim) { kbAim.x *= f; kbAim.y *= f; }
     if (reveal && reveal.points) for (i = 0; i < reveal.points.length; i++) scalePoint(reveal.points[i], f);
+    if (reveal && reveal.missX !== null && reveal.missX !== undefined) reveal.missX *= f;
     stroke = null; /* abandon a mid-resize drag */
     strokeId = null;
   }
@@ -466,5 +761,5 @@
   fitCanvas();
   var best = ArtDaily.best();
   hudBest.textContent = best === null ? '–' : String(best);
-  newRound();
+  doNewRound();
 })();

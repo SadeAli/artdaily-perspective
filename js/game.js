@@ -73,14 +73,24 @@
       sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
     }
     var tr = sxx + syy;
-    if (tr < 1e-6) return null;
+    /* `tr < 1e-6` alone let a NaN through: NaN < 1e-6 is false, so a point
+       cloud with one non-finite coordinate produced a fit object whose
+       every field was NaN, and scoreVpStroke then returned score: NaN —
+       which reaches the HUD, the toast and (via report) the permanent
+       best as the literal text "NaN". A fit that is not a real line is
+       NOT a fit: return null and let the caller say "that mark was too
+       short to read an angle from", which is the honest outcome and the
+       one path that is already handled everywhere. */
+    if (!isFinite(tr) || tr < 1e-6) return null;
     var disc = Math.sqrt(Math.max(0, (sxx - syy) * (sxx - syy) + 4 * sxy * sxy));
     var lambdaMin = (tr - disc) / 2; /* variance perpendicular to the fit */
-    return {
+    var out = {
       deg: 0.5 * Math.atan2(2 * sxy, sxx - syy) * 180 / Math.PI,
       cx: mx, cy: my,
       rms: Math.sqrt(Math.max(0, lambdaMin) / n)
     };
+    if (!isFinite(out.deg) || !isFinite(out.cx) || !isFinite(out.cy) || !isFinite(out.rms)) return null;
+    return out;
   }
 
   /* Straightness factor in [0.6, 1]: free below 1% wobble-per-span
@@ -144,16 +154,25 @@
        shallow one alike. missX is still reported, because "you crossed
        left of it" is the sentence the reveal wants. */
     var crossZero = Math.max(CROSS_ZERO_FRAC * canvasWidth, CROSS_ZERO_PX) * e;
-    var perpMiss = Math.abs((vpX - fit.cx) * Math.sin(th) - (vpY - fit.cy) * Math.cos(th));
+    var ux = Math.cos(th), uy = Math.sin(th);
+    var perpMiss = Math.abs((vpX - fit.cx) * uy - (vpY - fit.cy) * ux);
     var crossScore = isFinite(perpMiss) ? 100 * clamp01(1 - perpMiss / crossZero) : 0;
     var missX = null;
     if (Math.abs(Math.sin(th)) >= 1e-3) {
       missX = fit.cx + (vpY - fit.cy) / Math.tan(th) - vpX;
     }
+    /* The point on the drawn line closest to the true VP — the far end of
+       the distance that was actually scored. The reveal draws the gap so
+       the picture and the number agree; without it the sheet showed only
+       an × on the horizon, which on a shallow ray can sit hundreds of px
+       away from a line that in fact passed close. */
+    var proj = (vpX - fit.cx) * ux + (vpY - fit.cy) * uy;
     return {
       score: (0.5 * angleScore + 0.5 * crossScore) * straightnessFactor(fit.rms, span),
       angErr: angErr,
-      missX: missX
+      missX: missX,
+      perpMiss: perpMiss,
+      foot: isFinite(proj) ? { x: fit.cx + ux * proj, y: fit.cy + uy * proj } : null
     };
   }
 
@@ -298,8 +317,11 @@
     puzzle = typeA ? makePuzzleA(Math.floor(idx / 2)) : makePuzzleB(Math.floor(idx / 2));
     phase = 'play';
     var n = 'puzzle ' + (idx + 1) + ' of ' + PUZZLES_PER_ROUND + ' — ';
+    /* The drill draws a faint horizontal line on every puzzle and then, on
+       the opening screen, told the player the point "sits on the horizon"
+       without ever saying WHICH mark on the sheet the horizon is. Name it. */
     var teach = idx === 0
-      ? ' (parallel edges running away from you appear to meet at one spot — that spot is the vanishing point, and it always sits on the horizon.)'
+      ? ' (the faint flat line is the horizon — your own eye level. edges that are parallel in real life appear to meet at one spot on it, and that spot is the vanishing point.)'
       : '';
     hint.textContent = typeA
       ? n + 'two edges run away from you. press one of the dots at their near ends and pull the line onward to the spot where they would meet.' + teach
@@ -477,14 +499,34 @@
       avoid.push(reveal.points[0]);
       avoid.push(reveal.points[reveal.points.length - 1]);
     }
-    /* type A: × where the drawn line actually crossed the horizon */
-    if (reveal.missX !== null && reveal.missX !== undefined) {
-      var cx = Math.max(10, Math.min(W - 10, puzzle.vpX + reveal.missX));
+    /* type A: the gap that was actually scored — a hairline from the true
+       point out to the nearest spot on the line you drew. This is the
+       "passed 31px from the point" in the sentence, made visible. */
+    if (reveal.foot) {
       ctx.strokeStyle = c.ink;
-      ctx.lineWidth = 2.5;
-      line(cx - 6, puzzle.vpY - 6, cx + 6, puzzle.vpY + 6);
-      line(cx - 6, puzzle.vpY + 6, cx + 6, puzzle.vpY - 6);
-      avoid.push({ x: cx, y: puzzle.vpY });
+      ctx.lineWidth = 1.5;
+      ctx.globalAlpha = 0.75;
+      ctx.setLineDash([3, 3]);
+      line(puzzle.vpX, puzzle.vpY, reveal.foot.x, reveal.foot.y);
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+      avoid.push(reveal.foot);
+    }
+    /* type A: × where the drawn line actually crossed the horizon — only
+       when the crossing is genuinely on the sheet. It used to be clamped
+       to the frame edge, which on a shallow ray (where the crossing can
+       land thousands of px away) planted a confident × on a spot the line
+       never went near. The perpendicular hairline above carries the
+       lesson in that case, and the sentence still names the side. */
+    if (reveal.missX !== null && reveal.missX !== undefined && isFinite(reveal.missX)) {
+      var cx = puzzle.vpX + reveal.missX;
+      if (cx >= 10 && cx <= W - 10) {
+        ctx.strokeStyle = c.ink;
+        ctx.lineWidth = 2.5;
+        line(cx - 6, puzzle.vpY - 6, cx + 6, puzzle.vpY + 6);
+        line(cx - 6, puzzle.vpY + 6, cx + 6, puzzle.vpY - 6);
+        avoid.push({ x: cx, y: puzzle.vpY });
+      }
     }
 
     /* score flash, placed away from the action */
@@ -718,13 +760,28 @@
 
   /* ===== score bookkeeping ===== */
 
+  /* The reveal has to quote the miss the SCORE used. Half of a type-A mark
+     is the perpendicular distance from the vanishing point to the drawn
+     line, but the sentence quoted the horizon crossing instead — and on a
+     shallow ray those two disagree by a factor of three or four. A player
+     could read "180px left of the point" next to a 78 and conclude the
+     number was invented. Lead with the scored distance; the crossing side
+     is kept, because "you went past it on the left" is the fix. */
   function detailFor(type, r) {
     if (type === 'A') {
-      if (r.missX === null) return 'edge never met the horizon';
-      return Math.round(Math.abs(r.missX)) + 'px ' + (r.missX > 0 ? 'right' : 'left') + ' of the point';
+      if (!isFinite(r.perpMiss)) return 'could not read a line from that mark';
+      var d = Math.round(r.perpMiss);
+      if (d <= 2) return 'straight through the point';
+      return 'passed ' + d + 'px from the point' +
+        (r.missX === null || r.missX === undefined ? ''
+          : ', crossing the horizon ' + (r.missX > 0 ? 'right' : 'left') + ' of it');
     }
-    var out = r.angErr.toFixed(1) + '° off';
-    if (r.missY !== null) out += ', aimed ' + Math.round(Math.abs(r.missY)) + 'px ' + (r.missY < 0 ? 'high' : 'low');
+    var out = (isFinite(r.angErr) ? r.angErr.toFixed(1) : '?') + '° off';
+    /* `!== null` alone printed "NaN px low" for an undefined or non-finite
+       crossing — the reveal must never quote a number it does not have. */
+    if (typeof r.missY === 'number' && isFinite(r.missY)) {
+      out += ', aimed ' + Math.round(Math.abs(r.missY)) + 'px ' + (r.missY < 0 ? 'high' : 'low');
+    }
     return out;
   }
 
@@ -738,7 +795,8 @@
     reveal = {
       score: Math.round(r.score),
       points: pts,
-      missX: puzzle.type === 'A' ? r.missX : null
+      missX: puzzle.type === 'A' ? r.missX : null,
+      foot: puzzle.type === 'A' ? (r.foot || null) : null
     };
     phase = 'reveal';
     hint.textContent = feedbackLine(reveal.score, detailFor(puzzle.type, r))
@@ -853,6 +911,7 @@
     if (kbAim) { kbAim.x *= f; kbAim.y *= f; }
     if (reveal && reveal.points) for (i = 0; i < reveal.points.length; i++) scalePoint(reveal.points[i], f);
     if (reveal && reveal.missX !== null && reveal.missX !== undefined) reveal.missX *= f;
+    if (reveal && reveal.foot) scalePoint(reveal.foot, f);
     stroke = null; /* abandon a mid-resize drag */
     strokeId = null;
   }

@@ -21,8 +21,28 @@
 
   var SLUG = 'perspective';
   var PUZZLES_PER_ROUND = 6;
-  var GRAB_RADIUS = 28;   /* px around a start dot that begins a stroke */
+  var GRAB_RADIUS = 28;   /* base px around a start dot — eased per hardware */
+  /* SNAP, DO NOT REJECT. On a screenless tablet the hand is out of sight,
+     so acquiring a small dot is the single hardest thing that device
+     does, and a refusal produces no ink at all — which reads as "this
+     site is broken", not as "you missed". A press anywhere inside SNAP×
+     the grab radius is accepted and its first sample is translated onto
+     the dot, so the stroke the player meant is the stroke that is
+     scored. */
+  var GRAB_SNAP = 3;
   var MIN_STROKE = 24;    /* px of drag before an angle can be read */
+  /* A trackpad physically cannot pull a long stroke in one throw: it
+     runs out of pad, lifts, re-places and pulls again. A new press that
+     lands near the last lift, soon after, CONTINUES the same stroke
+     instead of being scored as a separate short one. */
+  var RESUME_MS = 900, RESUME_PX = 60;
+
+  /* The error at which a stroke scores zero, before easing. Both are
+     motor-skill tolerances on a drawn mark, so both get eased: a mouse
+     pivots at the wrist and cannot creep, a finger is a blunt tool. */
+  var ANG_ZERO_DEG = 18;
+  var CROSS_ZERO_FRAC = 0.11;
+  var CROSS_ZERO_PX = 42;  /* absolute floor, so a phone is not stricter */
   var MARGIN = 14;        /* constructions keep off the canvas edge */
   var KB_LEN = 0.35;      /* keyboard guide-edge length, fraction of W */
 
@@ -76,7 +96,8 @@
      P→VP edge, folded to [0,90]; base = 100 * clamp(1 - angErr/14),
      scaled by straightness. missY = where the drawn line crosses the
      VP's vertical, minus vpY (negative = aimed high). */
-  function scoreEdgeStroke(points, pX, pY, vpX, vpY) {
+  function scoreEdgeStroke(points, pX, pY, vpX, vpY, ease) {
+    var e = (typeof ease === 'number' && isFinite(ease) && ease > 0) ? ease : 1;
     var fit = fitLine(points);
     if (fit === null) return null;
     var span = Math.hypot(points[points.length - 1].x - points[0].x,
@@ -88,7 +109,7 @@
       ? null
       : fit.cy + (vpX - fit.cx) * Math.tan(th) - vpY;
     return {
-      score: 100 * clamp01(1 - angErr / 14) * straightnessFactor(fit.rms, span),
+      score: 100 * clamp01(1 - angErr / (ANG_ZERO_DEG * e)) * straightnessFactor(fit.rms, span),
       angErr: angErr,
       missY: missY
     };
@@ -100,20 +121,34 @@
      vs the true VP, as a fraction of canvas width (same 0.12
      tolerance the old tap used). Straightness scales the total.
      missX = crossing minus vpX (negative = crossed left of the VP). */
-  function scoreVpStroke(points, tipX, tipY, vpX, vpY, canvasWidth) {
+  function scoreVpStroke(points, tipX, tipY, vpX, vpY, canvasWidth, ease) {
     if (!(canvasWidth > 0)) return null;
+    var e = (typeof ease === 'number' && isFinite(ease) && ease > 0) ? ease : 1;
     var fit = fitLine(points);
     if (fit === null) return null;
     var span = Math.hypot(points[points.length - 1].x - points[0].x,
                           points[points.length - 1].y - points[0].y);
     var trueDeg = Math.atan2(vpY - tipY, vpX - tipX) * 180 / Math.PI;
     var angErr = foldDeg(fit.deg - trueDeg);
-    var angleScore = 100 * clamp01(1 - angErr / 14);
+    var angleScore = 100 * clamp01(1 - angErr / (ANG_ZERO_DEG * e));
     var th = fit.deg * Math.PI / 180;
-    var missX = null, crossScore = 0;
+    /* HOW FAR THE LINE PASSES FROM THE POINT, measured perpendicular to
+       the line itself — not where it crosses the horizon.
+       The horizontal crossing was the wrong yardstick: when the true ray
+       is shallow (which it usually is, because the vanishing point sits
+       out sideways) a 1° wobble slides the horizon crossing by three or
+       four times as much as it moves the line. That amplification is
+       geometry, not skill, and it hit exactly the strokes a beginner
+       makes. The perpendicular miss says the honest thing — "your line
+       passed this far from the point" — and treats a steep ray and a
+       shallow one alike. missX is still reported, because "you crossed
+       left of it" is the sentence the reveal wants. */
+    var crossZero = Math.max(CROSS_ZERO_FRAC * canvasWidth, CROSS_ZERO_PX) * e;
+    var perpMiss = Math.abs((vpX - fit.cx) * Math.sin(th) - (vpY - fit.cy) * Math.cos(th));
+    var crossScore = isFinite(perpMiss) ? 100 * clamp01(1 - perpMiss / crossZero) : 0;
+    var missX = null;
     if (Math.abs(Math.sin(th)) >= 1e-3) {
       missX = fit.cx + (vpY - fit.cy) / Math.tan(th) - vpX;
-      crossScore = 100 * clamp01(1 - (Math.abs(missX) / canvasWidth) / 0.12);
     }
     return {
       score: (0.5 * angleScore + 0.5 * crossScore) * straightnessFactor(fit.rms, span),
@@ -257,12 +292,18 @@
     strokeId = null;
     grabTip = null;
     kbAim = null;
+    pending = null;
+    lastLift = null;
     var typeA = idx % 2 === 0;
     puzzle = typeA ? makePuzzleA(Math.floor(idx / 2)) : makePuzzleB(Math.floor(idx / 2));
     phase = 'play';
+    var n = 'puzzle ' + (idx + 1) + ' of ' + PUZZLES_PER_ROUND + ' — ';
+    var teach = idx === 0
+      ? ' (parallel edges running away from you appear to meet at one spot — that spot is the vanishing point, and it always sits on the horizon.)'
+      : '';
     hint.textContent = typeA
-      ? 'puzzle ' + (idx + 1) + ' of ' + PUZZLES_PER_ROUND + ' — two edges recede. press a tip-dot, stroke the edge on to their hidden meeting point.'
-      : 'puzzle ' + (idx + 1) + ' of ' + PUZZLES_PER_ROUND + ' — press the bold dot, drag the edge into the ringed point. blind: ink shows when you release.';
+      ? n + 'two edges run away from you. press one of the dots at their near ends and pull the line onward to the spot where they would meet.' + teach
+      : n + 'press the bold dot and pull the line into the ringed point. blind: the ink appears when you let go.' + teach;
     draw();
   }
 
@@ -486,7 +527,14 @@
     return { x: ev.clientX - rect.left, y: ev.clientY - rect.top };
   }
 
+  var lastPenAt = 0;
+  var lastLift = null;   /* { x, y, at } — where the previous stroke ended */
+  var pending = null;    /* samples carried over from a lifted stroke */
+
   canvas.addEventListener('pointerdown', function (ev) {
+    /* palm rejection: a pen always beats a palm that landed first */
+    if (ev.pointerType === 'pen') lastPenAt = Date.now();
+    else if (ev.pointerType === 'touch' && Date.now() - lastPenAt < 500) return;
     /* reveals are player-paced: a tap moves on */
     if (phase === 'reveal') {
       ev.preventDefault();
@@ -496,27 +544,47 @@
     if (phase !== 'play' || !puzzle || stroke) return;
     ev.preventDefault();
     var p = pointerPos(ev), i, s, d;
-    if (puzzle.type === 'A') {
-      /* grab the nearest inner tip-dot */
-      grabTip = null;
-      var bestD = GRAB_RADIUS;
-      for (i = 0; i < puzzle.segs.length; i++) {
-        s = puzzle.segs[i];
-        d = Math.hypot(p.x - s.x1, p.y - s.y1);
-        if (d <= bestD) { bestD = d; grabTip = { x: s.x1, y: s.y1 }; }
-      }
-      if (!grabTip) {
-        hint.textContent = 'start on one of the tip-dots, then stroke the edge onward.';
-        return;
-      }
-    } else {
-      if (Math.hypot(p.x - puzzle.pX, p.y - puzzle.pY) > GRAB_RADIUS) {
-        hint.textContent = 'start on the bold dot, then drag toward the ringed point.';
-        return;
+    var grabR = ArtDaily.startRadius(GRAB_RADIUS);
+
+    /* A press that lands near where the last one lifted, soon after, is
+       the same stroke carrying on — a trackpad running out of pad, not a
+       new attempt. No snapping and no anchor test on a resume. */
+    var resuming = !!(pending && lastLift &&
+      Date.now() - lastLift.at <= RESUME_MS &&
+      Math.hypot(p.x - lastLift.x, p.y - lastLift.y) <= RESUME_PX);
+
+    if (!resuming) {
+      pending = null;
+      if (puzzle.type === 'A') {
+        /* grab the nearest inner tip-dot, snapping rather than refusing */
+        grabTip = null;
+        var bestD = grabR * GRAB_SNAP;
+        for (i = 0; i < puzzle.segs.length; i++) {
+          s = puzzle.segs[i];
+          d = Math.hypot(p.x - s.x1, p.y - s.y1);
+          if (d <= bestD) { bestD = d; grabTip = { x: s.x1, y: s.y1 }; }
+        }
+        if (!grabTip) {
+          hint.textContent = 'start near one of the tip-dots, then stroke the edge onward.';
+          return;
+        }
+        if (bestD > grabR) {
+          /* outside the dot but inside the snap ring: put the first
+             sample ON the dot instead of throwing the stroke away */
+          p = { x: grabTip.x, y: grabTip.y };
+        }
+      } else {
+        d = Math.hypot(p.x - puzzle.pX, p.y - puzzle.pY);
+        if (d > grabR * GRAB_SNAP) {
+          hint.textContent = 'start near the bold dot, then drag toward the ringed point.';
+          return;
+        }
+        if (d > grabR) p = { x: puzzle.pX, y: puzzle.pY };
       }
     }
     try { canvas.setPointerCapture(ev.pointerId); } catch (e) {}
-    stroke = [p];
+    stroke = resuming ? pending.concat([p]) : [p];
+    pending = null;
     strokeId = ev.pointerId;
     kbAim = null;
     draw();
@@ -539,7 +607,9 @@
     var pts = stroke;
     stroke = null;
     strokeId = null;
-    pts.push(pointerPos(ev));
+    var end = pointerPos(ev);
+    pts.push(end);
+    lastLift = { x: end.x, y: end.y, at: Date.now() };
     commitStroke(pts);
   });
 
@@ -555,17 +625,25 @@
 
   function commitStroke(pts) {
     var span = Math.hypot(pts[pts.length - 1].x - pts[0].x, pts[pts.length - 1].y - pts[0].y);
+    var ease = ArtDaily.ease(1);
     var r = null;
     if (span >= MIN_STROKE) {
       r = puzzle.type === 'A'
-        ? scoreVpStroke(pts, grabTip.x, grabTip.y, puzzle.vpX, puzzle.vpY, W)
-        : scoreEdgeStroke(pts, puzzle.pX, puzzle.pY, puzzle.vpX, puzzle.vpY);
+        ? scoreVpStroke(pts, grabTip.x, grabTip.y, puzzle.vpX, puzzle.vpY, W, ease)
+        : scoreEdgeStroke(pts, puzzle.pX, puzzle.pY, puzzle.vpX, puzzle.vpY, ease);
     }
     if (r === null) {
-      hint.textContent = 'too short — stroke a longer edge so its angle can be read.';
+      /* NOT SCORED — say what happened and why, and hold the samples so
+         picking up where you lifted continues this stroke rather than
+         starting a bad short one. A short mark on a trackpad usually
+         means the pad ran out, not that the player did. */
+      pending = pts;
+      hint.textContent = 'that mark was too short to read an angle from — nothing scored.' +
+        ' press again where you lifted (within a second) and keep pulling the same line.';
       draw();
       return;
     }
+    pending = null;
     settlePuzzle(r, pts);
   }
 

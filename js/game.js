@@ -97,7 +97,12 @@
      (honest hand tremor), sliding penalty up to 40% by 7% — a slow
      steered arc can't cash in on where it happened to end up. */
   function straightnessFactor(rms, span) {
-    if (!(span > 0)) return 1;
+    /* This multiplies the WHOLE score, so a NaN here is a NaN score — the
+       one value that must never reach the HUD or the permanent best.
+       fitLine already refuses to hand out a non-finite rms, so this guard
+       is the identity in real play; it exists so the next refactor of
+       fitLine cannot quietly turn a broken fit into "NaN / 100". */
+    if (!(span > 0) || !isFinite(rms)) return 1;
     var r = rms / span;
     return 0.6 + 0.4 * clamp01(1 - Math.max(0, r - 0.01) / 0.06);
   }
@@ -205,7 +210,16 @@
     return out;
   }
 
+  /* getComputedStyle() on the root forces a style resolve, and this ran at
+     the top of every repaint — once per pointer sample while a stroke is
+     being pulled — plus two hex parses and a mix for the accent. The
+     tokens only move when the sheet flips theme, so cache them against
+     data-theme; the cache invalidates itself the moment that attribute
+     changes, so onTheme still repaints in the new colours. */
+  var inkCache = null, inkKey = null;
   function inks() {
+    var key = document.documentElement.dataset.theme || '';
+    if (inkCache && inkKey === key) return inkCache;
     var cs = getComputedStyle(document.documentElement);
     var ink = cs.getPropertyValue('--ink').trim();
     var accent = cs.getPropertyValue('--game-accent').trim() || cs.getPropertyValue('--bubblegum').trim();
@@ -214,24 +228,45 @@
        already clears AA. Everything the reveal means — the true VP, the
        construction lines, the score — is painted in this. */
     if (ArtDaily.theme() !== 'dark') accent = mixHex(accent, ink, 0.55);
-    return {
+    inkKey = key;
+    inkCache = {
       ink: ink,
       muted: cs.getPropertyValue('--muted').trim(),
       accent: accent,
     };
+    return inkCache;
   }
 
-  /* ---- crisp canvas at any devicePixelRatio; height tracks width ---- */
-  var W = 0, H = 0;
+  /* ---- crisp canvas at any devicePixelRatio; height tracks width ----
+     Returns true only when the sheet really changed size: assigning
+     canvas.width reallocates and clears the backing store, and `resize`
+     fires on every address-bar nudge on a phone. */
+  var W = 0, H = 0, fitDpr = 0;
   function fitCanvas() {
     var rect = canvas.getBoundingClientRect();
-    W = Math.max(1, Math.round(rect.width));
-    H = Math.round(W * 0.62);
+    var w = Math.max(1, Math.round(rect.width));
     var dpr = window.devicePixelRatio || 1;
+    if (w === W && dpr === fitDpr) return false;
+    W = w;
+    H = Math.round(W * 0.62);
+    fitDpr = dpr;
     canvas.width = Math.round(W * dpr);
     canvas.height = Math.round(H * dpr);
     canvas.style.height = H + 'px';
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return true;
+  }
+
+  /* ---- one repaint per frame ----
+     A pointermove can land two or three times inside one displayed frame,
+     and each one used to redraw the horizon, both given edges, their grab
+     dots and the whole live polyline. Only the last is ever shown. One
+     rAF paints on the same vsync with the rest of that work skipped. */
+  var drawQueued = false;
+  function requestDraw() {
+    if (drawQueued) return;
+    drawQueued = true;
+    requestAnimationFrame(function () { drawQueued = false; draw(); });
   }
 
   /* ===== round state ===== */
@@ -564,9 +599,18 @@
 
   /* ===== input ===== */
 
+  /* getBoundingClientRect() is a layout read, and this used to run once
+     per pointer sample. The sheet cannot move under a live stroke without
+     a scroll or a resize, and the hint line above it only re-wraps
+     between puzzles, so measure once per gesture and drop the
+     measurement on scroll or resize. */
+  var canvasRect = null;
+  function dropRect() { canvasRect = null; }
+  window.addEventListener('scroll', dropRect, true);
+
   function pointerPos(ev) {
-    var rect = canvas.getBoundingClientRect();
-    return { x: ev.clientX - rect.left, y: ev.clientY - rect.top };
+    var r = canvasRect || (canvasRect = canvas.getBoundingClientRect());
+    return { x: ev.clientX - r.left, y: ev.clientY - r.top };
   }
 
   var lastPenAt = 0;
@@ -585,6 +629,7 @@
     }
     if (phase !== 'play' || !puzzle || stroke) return;
     ev.preventDefault();
+    dropRect();                  /* a fresh gesture re-measures the sheet */
     var p = pointerPos(ev), i, s, d;
     var grabR = ArtDaily.startRadius(GRAB_RADIUS);
 
@@ -638,15 +683,37 @@
     draw();
   });
 
+  /* SAMPLING FIDELITY ON A FAST STROKE. One pointermove is one sample,
+     but the digitizer under it reports at 120–240Hz and the browser hands
+     over only what it could deliver in time. Pull the line quickly — which
+     is exactly what a confident stroke IS, and what this drill asks for —
+     and most of it never reaches the fit: a whole sweep can arrive as five
+     or six points, a short one as two, which is the difference between a
+     scored mark and "that mark was too short to read an angle from".
+     Ask for the merged samples. The 3px spacing filter still stands, so
+     the point count is bounded by the stroke's own length and a slow patch
+     cannot outvote the rest of the line in the least-squares fit. */
+  var SAMPLE_MIN_PX = 3;
+  function pushSamples(ev, arr) {
+    var list = null, added = false;
+    try { list = ev.getCoalescedEvents ? ev.getCoalescedEvents() : null; } catch (e) { list = null; }
+    if (!list || !list.length) list = [ev];
+    for (var i = 0; i < list.length; i++) {
+      var p = pointerPos(list[i]);
+      if (!isFinite(p.x) || !isFinite(p.y)) continue;
+      var last = arr[arr.length - 1];
+      if (!last || Math.hypot(p.x - last.x, p.y - last.y) >= SAMPLE_MIN_PX) {
+        arr.push(p);
+        added = true;
+      }
+    }
+    return added;
+  }
+
   canvas.addEventListener('pointermove', function (ev) {
     if (!stroke || ev.pointerId !== strokeId || phase !== 'play') return;
     ev.preventDefault();
-    var p = pointerPos(ev);
-    var last = stroke[stroke.length - 1];
-    if (Math.hypot(p.x - last.x, p.y - last.y) >= 3) {
-      stroke.push(p);
-      draw();
-    }
+    if (pushSamples(ev, stroke)) requestDraw();
   });
 
   function onStrokeUp(ev) {
@@ -742,7 +809,8 @@
         kbAim = { x: ox, y: oy, deg: puzzle.vpX >= ox ? 0 : 180 };
       }
       kbAim.deg += arrows[ev.key] * (ev.shiftKey ? 0.5 : 2);
-      draw();
+      /* a held arrow auto-repeats faster than the screen refreshes */
+      requestDraw();
     } else if (ev.key === 'Enter' && kbAim) {
       ev.preventDefault();
       var th = kbAim.deg * Math.PI / 180;
@@ -917,8 +985,13 @@
   }
 
   window.addEventListener('resize', function () {
+    dropRect();
     var oldW = W;
-    fitCanvas();
+    /* fitCanvas is a no-op when the sheet did not really change, so a
+       phone's address bar sliding away during an ordinary scroll no
+       longer reallocates the backing store — nor, through scalePuzzle,
+       abandons a stroke that is still being pulled. */
+    if (!fitCanvas()) { draw(); return; }
     if (puzzle && oldW > 0 && W !== oldW) scalePuzzle(W / oldW);
     draw();
   });

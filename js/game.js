@@ -352,8 +352,17 @@
     puzzle = typeA ? makePuzzleA(Math.floor(idx / 2)) : makePuzzleB(Math.floor(idx / 2));
     phase = 'play';
     var n = 'puzzle ' + (idx + 1) + ' of ' + PUZZLES_PER_ROUND + ' — ';
+    /* "THE DOTS AT THEIR NEAR ENDS" POINTED THE WRONG WAY. placeSegment
+       puts each grab dot at x1 — the end of its edge NEAREST the vanishing
+       point, i.e. the far, distant end of a receding edge in the picture.
+       To anyone who already thinks in perspective, "the near end" is the
+       opposite end, the big foreground one; to a beginner it names nothing
+       at all, and this is the very first press the drill ever asks for.
+       Point at the dot instead — there is exactly one per edge and it is
+       drawn with a halo — and say the action as continuing the line, which
+       is what the stroke actually is. */
     say(typeA
-      ? n + 'two edges run away from you. press one of the dots at their near ends and pull the line onward to the spot where they would meet.'
+      ? n + 'two edges run away from you and would meet somewhere off in the distance. press the dot on the end of either edge, then keep that same line going, out to where you think they meet.'
       : n + 'press the bold dot and pull the line into the ringed point. blind: the ink appears when you let go.');
     draw();
   }
@@ -669,7 +678,7 @@
           if (d <= bestD) { bestD = d; tip = { x: s.x1, y: s.y1 }; }
         }
         if (!tip) {
-          say('start on one of the dots at the near ends of the two edges, then pull the line onward.');
+          say('start on the dot at the end of one of the two edges, then keep that same line going.');
           return;
         }
         grabTip = tip;
@@ -770,7 +779,7 @@
        grab leaves grabTip alone, but commitStroke is the keyboard's
        entry point too and must never be able to throw. */
     if (puzzle.type === 'A' && !grabTip) {
-      say('start on one of the dots at the near ends of the two edges, then pull the line onward.');
+      say('start on the dot at the end of one of the two edges, then keep that same line going.');
       draw();
       return;
     }
@@ -875,10 +884,22 @@
      reading "–" for all six puzzles, so a beginner's only answer to "how
      am I doing" was the score flashed on the sheet for one puzzle and
      then painted over. */
+  /* scoreVpStroke / scoreEdgeStroke can only hand this finite 0–100 values
+     (they return null rather than a broken number), but this mean is what
+     reaches ArtDaily.report — and from there the permanent personal best —
+     as well as the HUD after every puzzle, and it had no sanitizing layer
+     at all: one bad entry would print the literal text "NaN" and store it
+     as a best no round could ever beat. Clamped as well as
+     finiteness-checked, the way the sibling drills' means already are,
+     because a finite "3e+307 / 100" is no better on the HUD than a NaN.
+     The identity on every value this drill has ever produced. */
   function meanScore(list) {
     if (!list.length) return 0;
-    var s = 0, i;
-    for (i = 0; i < list.length; i++) s += list[i].score;
+    var s = 0, i, v;
+    for (i = 0; i < list.length; i++) {
+      v = list[i] ? list[i].score : 0;
+      s += (typeof v === 'number' && isFinite(v)) ? Math.max(0, Math.min(100, v)) : 0;
+    }
     return s / list.length;
   }
 
@@ -892,7 +913,24 @@
       foot: puzzle.type === 'A' ? (r.foot || null) : null
     };
     phase = 'reveal';
-    hint.textContent = feedbackLine(reveal.score, detailFor(puzzle.type, r))
+    /* THE FIRST REVEAL HAS TO SAY WHAT THE NEW MARKS ARE. Puzzle 1's
+       reveal drops a ringed dot, two dashed rays and a hairline onto a
+       sheet that has never carried any of them, and the sentence beside it
+       talked only about pixels — so the one picture that shows a beginner
+       where the point actually was arrived unnamed, and read as decoration
+       around a grade. Every sibling drill names its reveal on sight ("the
+       dashed ghost is the target pose", "the coloured line is the true
+       1/2", "the coloured line and rings are the real answer"); this one
+       now does too, once, on the screen where the marks are new. */
+    var marks = '';
+    if (idx === 0) {
+      marks = puzzle.type === 'A'
+        ? ' the ringed dot on the horizon is where those two edges really meet' +
+          (reveal.foot && isFinite(r.perpMiss) && r.perpMiss > 3
+            ? '; the hairline is the gap your line left.' : '.')
+        : ' the dashed line is the edge you were aiming for.';
+    }
+    hint.textContent = feedbackLine(reveal.score, detailFor(puzzle.type, r)) + marks
       + (results.length < PUZZLES_PER_ROUND ? ' tap for the next puzzle.' : ' tap to finish the round.');
     draw();
   }

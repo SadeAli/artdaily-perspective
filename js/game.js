@@ -743,9 +743,23 @@
     var pts = stroke;
     stroke = null;
     strokeId = null;
+    /* The release position is the one sample that never went through
+       pushSamples, so it is also the one that was never checked. A
+       non-finite coordinate here makes every sum in fitLine NaN and the mark
+       comes back "too short to read an angle from" — a refusal aimed at a
+       player whose stroke was fine. Fall back to where the stroke already
+       was; the release adds at most the last three pixels of it. */
     var end = pointerPos(ev);
-    pts.push(end);
-    lastLift = { x: end.x, y: end.y, at: Date.now() };
+    if (!isFinite(end.x) || !isFinite(end.y)) {
+      /* a fresh object, never the last sample itself — scalePuzzle walks
+         these arrays and would rescale a shared one twice */
+      var back = pts[pts.length - 1];
+      end = back ? { x: back.x, y: back.y } : null;
+    }
+    if (end) {
+      pts.push(end);
+      lastLift = { x: end.x, y: end.y, at: Date.now() };
+    }
     commitStroke(pts);
   }
 
@@ -1042,6 +1056,16 @@
     if (reveal && reveal.points) for (i = 0; i < reveal.points.length; i++) scalePoint(reveal.points[i], f);
     if (reveal && reveal.missX !== null && reveal.missX !== undefined) reveal.missX *= f;
     if (reveal && reveal.foot) scalePoint(reveal.foot, f);
+    /* THE HELD-OVER STROKE LIVES IN PIXELS TOO. A mark too short to read is
+       not thrown away: its samples are parked in `pending` and a press back
+       near `lastLift` within RESUME_MS carries on the same stroke. Both were
+       left at the old scale here, so a resize in that window — an orientation
+       flip, a desktop window drag, an address bar on a narrow phone — spliced
+       old-scale samples onto new-scale ones and fitted a line with a kink in
+       it that the hand never made, then scored it. Rescaling them is the same
+       uniform rescale everything else on the sheet just had. */
+    for (i = 0; pending && i < pending.length; i++) scalePoint(pending[i], f);
+    if (lastLift) { lastLift.x *= f; lastLift.y *= f; }
     stroke = null; /* abandon a mid-resize drag */
     strokeId = null;
   }

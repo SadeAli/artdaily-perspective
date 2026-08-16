@@ -352,16 +352,28 @@
     puzzle = typeA ? makePuzzleA(Math.floor(idx / 2)) : makePuzzleB(Math.floor(idx / 2));
     phase = 'play';
     var n = 'puzzle ' + (idx + 1) + ' of ' + PUZZLES_PER_ROUND + ' — ';
-    /* The drill draws a faint horizontal line on every puzzle and then, on
-       the opening screen, told the player the point "sits on the horizon"
-       without ever saying WHICH mark on the sheet the horizon is. Name it. */
-    var teach = idx === 0
-      ? ' (the faint flat line is the horizon — your own eye level. edges that are parallel in real life appear to meet at one spot on it, and that spot is the vanishing point.)'
-      : '';
-    hint.textContent = typeA
-      ? n + 'two edges run away from you. press one of the dots at their near ends and pull the line onward to the spot where they would meet.' + teach
-      : n + 'press the bold dot and pull the line into the ringed point. blind: the ink appears when you let go.' + teach;
+    say(typeA
+      ? n + 'two edges run away from you. press one of the dots at their near ends and pull the line onward to the spot where they would meet.'
+      : n + 'press the bold dot and pull the line into the ringed point. blind: the ink appears when you let go.');
     draw();
+  }
+
+  /* THE OPENING LESSON SURVIVES THE FIRST FUMBLE.
+     The drill draws a faint horizontal line on every puzzle and, on the
+     opening screen only, the hint is the one place that names it — and
+     defines "vanishing point" at all. But every in-puzzle re-prompt
+     (missed the tip-dot, missed the bold dot, mark too short to read)
+     wrote straight over hint.textContent, and a beginner's FIRST press is
+     exactly the press most likely to miss or to stop short. The one
+     sentence that explains what the drill is about was being deleted by
+     the player's first attempt to play it, with no way back short of
+     "how to play". Every prompt now goes through here, and puzzle 1 keeps
+     its gloss underneath whatever just happened. */
+  var TEACH = ' (the faint flat line is the horizon — your own eye level.' +
+    ' edges that are parallel in real life appear to meet at one spot on it,' +
+    ' and that spot is the vanishing point.)';
+  function say(msg) {
+    hint.textContent = msg + (idx === 0 ? TEACH : '');
   }
 
   function doNewRound() {
@@ -657,7 +669,7 @@
           if (d <= bestD) { bestD = d; tip = { x: s.x1, y: s.y1 }; }
         }
         if (!tip) {
-          hint.textContent = 'start near one of the tip-dots, then stroke the edge onward.';
+          say('start on one of the dots at the near ends of the two edges, then pull the line onward.');
           return;
         }
         grabTip = tip;
@@ -669,7 +681,7 @@
       } else {
         d = Math.hypot(p.x - puzzle.pX, p.y - puzzle.pY);
         if (d > grabR * GRAB_SNAP) {
-          hint.textContent = 'start near the bold dot, then drag toward the ringed point.';
+          say('start on the bold dot, then drag toward the ringed point.');
           return;
         }
         if (d > grabR) p = { x: puzzle.pX, y: puzzle.pY };
@@ -758,7 +770,7 @@
        grab leaves grabTip alone, but commitStroke is the keyboard's
        entry point too and must never be able to throw. */
     if (puzzle.type === 'A' && !grabTip) {
-      hint.textContent = 'start near one of the tip-dots, then stroke the edge onward.';
+      say('start on one of the dots at the near ends of the two edges, then pull the line onward.');
       draw();
       return;
     }
@@ -776,8 +788,8 @@
          starting a bad short one. A short mark on a trackpad usually
          means the pad ran out, not that the player did. */
       pending = pts;
-      hint.textContent = 'that mark was too short to read an angle from — nothing scored.' +
-        ' press again where you lifted (within a second) and keep pulling the same line.';
+      say('that mark was too short to read an angle from — nothing scored.' +
+        ' press again where you lifted (within a second) and keep pulling the same line.');
       draw();
       return;
     }
@@ -858,8 +870,21 @@
     return word + ' — ' + s + ' (' + detail + ').';
   }
 
+  /* Mean of what has been scored so far. Three of the six sibling drills
+     already keep the HUD alive this way; this one left the "score" field
+     reading "–" for all six puzzles, so a beginner's only answer to "how
+     am I doing" was the score flashed on the sheet for one puzzle and
+     then painted over. */
+  function meanScore(list) {
+    if (!list.length) return 0;
+    var s = 0, i;
+    for (i = 0; i < list.length; i++) s += list[i].score;
+    return s / list.length;
+  }
+
   function settlePuzzle(r, pts) {
     results.push({ type: puzzle.type, score: r.score });
+    hudScore.textContent = String(Math.round(meanScore(results)));
     reveal = {
       score: Math.round(r.score),
       points: pts,
@@ -885,14 +910,13 @@
     reveal = null;
     kbAim = null;
     grabTip = null;
-    var sum = 0, hunt = [], aim = [], hSum = 0, aSum = 0, i, e;
+    var hunt = [], aim = [], hSum = 0, aSum = 0, i, e;
     for (i = 0; i < results.length; i++) {
       e = results[i];
-      sum += e.score;
       if (e.type === 'A') { hunt.push(Math.round(e.score)); hSum += e.score; }
       else { aim.push(Math.round(e.score)); aSum += e.score; }
     }
-    var res = ArtDaily.report(sum / results.length);
+    var res = ArtDaily.report(meanScore(results));
     recap = {
       round: round,
       mean: res.score,
